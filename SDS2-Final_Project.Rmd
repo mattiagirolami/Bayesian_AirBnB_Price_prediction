@@ -1,0 +1,1058 @@
+---
+title: "Prediction of AIRBNB prices in Rome"
+author: "Girolami Mattia"
+date: "2024-07-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Abstract
+
+The goal of this project is to predict Airbnb prices in the city of Rome and identify the most relevant features for determining these prices.
+
+The data was obtained from **[Inside Airbnb]**(https://insideairbnb.com/rome/), a free platform that allows for the download of Airbnb data for the desired city.
+
+# Features
+
+```{r, include=FALSE, warnings=FALSE}
+library(ggplot2)
+library(corrplot)
+library(bayesplot)
+library(dplyr)
+library(stringr)
+library(rjags)
+library(R2jags)
+library(GGally)
+library(tidyr)
+library(coda)
+library(geosphere)
+library(mcmc)
+library(ggmcmc)
+library(leaflet)
+library(leaflet.extras)
+library(gridExtra)
+library(DT)
+library(scales)
+library(kableExtra)
+library(Metrics)
+```
+
+```{r, include=FALSE}
+data <- read.csv("reduced_listings.csv")
+
+data <- data %>% dplyr::select(-description, -neighborhood_overview, -amenities)
+```
+
+```{r, echo = FALSE, results='asis'}
+#datatable(head(data), options = list(scrollX = TRUE))
+#datatable(head(data), options = list(pageLength = 10))
+kable(head(data[, 1:10], 10))
+```
+
+```{r, echo =FALSE}
+cat("The dataset has ", length(names(data))," columns.")
+```
+
+```{r, include=FALSE}
+data_clean <- data %>% dplyr::select(
+  price, host_response_rate, host_acceptance_rate,
+  latitude, longitude, accommodates, beds, availability_365, number_of_reviews,
+  review_scores_cleanliness, review_scores_communication, review_scores_location, room_type,      neighbourhood_cleansed, property_type)
+
+```
+
+As observed, the dataset contains a large number of features, most of which are descriptive in nature, such as the URL, scrape ID, etc.
+To facilitate data analysis, we will focus exclusively on the features that are most pertinent to our analysis. These are:
+
+* *Price*: meant as price($) per night, our target variable
+* *Accommodates*: the number of person the Airbnb can host
+* *Beds*: the number of beds in the Airbnb
+* *Room Type* : the type of accommodation (e.g. private room, hotel, entire room/apt)
+* *Latitude* and *Longitude*: the coordinates of the Airbnb
+* *Availability365* : the number of days an Airbnb is booked in a year
+* *Host Acceptance* and *Response rate*: how much an host is likely to answer the messages and accept people
+* *Number of reviews* : total number of reviews
+* *Review scores*:
+  * *Communication* : a score indicating how effective the communication with the host was
+  * *Location* : a score indicating the comfort of the accommodation location
+  * *Cleanliness* : a score indicating the cleanliness of the accommodation
+* *Neighborhood* : The neighborhood of the stay
+* *Property Type* : The type of rental unit (entire condo, entire rental unit etc.)
+
+
+
+# Feature Engineering
+
+Before proceeding with the analysis, feature engineering is required because the columns contain values that cannot be processed in their current format.
+
+To make the latitude and longitude features relevant, I decided to create new features.
+Firstly, I selected four well-known points of interest in the city of Rome: the **Colosseum**, the **Vatican**, **Trastevere**, and **Piazza di Spagna**. After selecting these points, I obtained their coordinates (*LAT, LONG*) and calculated the Haversine distance from each Airbnb listing to the chosen points of interest, adding the reciprocal of the distance as a new feature for each field in order to have higher scores for places near the POI and lower scores for those furthest away .
+
+```{r}
+calculate_distance <- function(lat1, lon1, lat2, lon2) {
+  distHaversine(c(lon1, lat1), c(lon2, lat2)) / 1000  # Distance in kilometers
+}
+```
+
+```{r}
+# Points of Interest (POIs)
+pois <- data.frame(
+  name = c("Colosseo", "Vaticano", "Trastevere", "Spagna"),
+  latitude = c(41.890251, 41.907989638871555, 41.891826, 41.9057843812776),
+  longitude = c(12.492373, 12.455535072091655, 12.469973, 12.482191227341854)
+)
+```
+
+```{r}
+for (i in 1:nrow(pois)) {
+  poi_name <- tolower(pois$name[i])
+  data_clean[[paste0("distance_from_", poi_name)]] <- mapply(
+    calculate_distance,
+    data_clean$latitude,
+    data_clean$longitude,
+    MoreArgs = list(lat2 = pois$latitude[i], lon2 = pois$longitude[i])
+  )
+}
+```
+
+The remaining features were manipulated as follows:
+
+* Rows with null values were removed.
+* The price feature was converted to a numeric format by removing the '$' symbol.
+* Host response rate and host acceptance rate were converted from percentage strings (xx%) to numeric format between 0 and 1.
+* The beds feature was binarized, assigning a value of 1 to locations with 1 or 2 beds and 0 otherwise.
+* The accommodates feature was binarized into three new binary features: one for 1 or 2 guests (for solo travelers or couples), one for 3 to 6 guests (potentially for families or small groups), and one for 7 to 15 guests (large groups).
+* The number of reviews feature was logarithmically transformed to mitigate the effect of outliers (locations with significantly more reviews compared to others).
+* Availability_365, review scores for communication, location, and cleanliness were normalized.
+
+```{r, echo= FALSE, warning=FALSE}
+data_clean <- data_clean%>%
+  filter(complete.cases(.)) %>%
+  filter(beds <= 6) %>%
+  mutate(price = as.numeric(gsub("[\\$,]", "", price)),
+         host_response_rate = as.numeric(str_remove(host_response_rate, "%")) / 100,
+         host_acceptance_rate = as.numeric(str_remove(host_acceptance_rate, "%")) / 100,
+         accommodates_1_2 = ifelse(accommodates %in% 1:2, 1, 0),
+         accommodates_3_6 = ifelse(accommodates %in% 3:6, 1, 0),
+         accommodates_7_15 = ifelse(accommodates %in% 7:15, 1, 0),
+         beds = ifelse(beds == 0, 1, beds),
+         beds = as.integer(beds),
+         max2_beds = ifelse(beds %in% 1:2, 1, 0),
+         availability_365 = (availability_365-min(availability_365))/(max(availability_365)-min(availability_365)),
+         number_of_reviews = log(number_of_reviews + 1),
+         review_scores_cleanliness = (review_scores_cleanliness-min(review_scores_cleanliness))/(max(review_scores_cleanliness)-min(review_scores_cleanliness)),
+         review_scores_communication = (review_scores_communication-min(review_scores_communication))/(max(review_scores_communication)-min(review_scores_communication)),
+         review_scores_location = (review_scores_location-min(review_scores_location))/(max(review_scores_location)-min(review_scores_location)))  %>%
+  filter(complete.cases(.))
+```
+
+
+
+
+```{r, warning=FALSE}
+tosave_2 <- c("price", "host_response_rate", "host_acceptance_rate",
+              "accommodates_1_2", "accommodates_3_6", "accommodates_7_15",
+              "max2_beds", "latitude", "longitude",
+              "availability_365", "number_of_reviews",
+              "review_scores_cleanliness", "review_scores_communication", "review_scores_location",
+              "distance_from_colosseo", "distance_from_vaticano",
+              "distance_from_trastevere", "distance_from_spagna", "room_type", "neighbourhood_cleansed", 'property_type')
+
+data_clean <- data_clean %>%
+  dplyr::select(tosave_2) %>%
+  mutate(
+    distance_from_colosseo = 1 / distance_from_colosseo,
+    distance_from_vaticano = 1 / distance_from_vaticano,
+    distance_from_trastevere = 1 / distance_from_trastevere,
+    distance_from_spagna = 1 / distance_from_spagna,
+  )
+```
+
+After the preprocessing part these are the results.
+
+```{r, echo = FALSE}
+cat("Number of null values:", sum(is.na(data_clean)))
+```
+```{r, echo = FALSE}
+#datatable(head(data_clean), options = list(scrollX = TRUE))
+kable(head(data_clean[, 1:10], 10), caption = "Sample of the Data")
+
+```
+
+```{r}
+summary(data_clean)
+```
+# Exploratory Data Analysis
+
+## Maps visualization
+
+To further enhance our data analysis, I decided to visualize the locations of the Airbnb listings from the dataset by plotting them on a map. This allows us to observe areas with higher concentrations of Airbnb listings and to evaluate whether the features previously added based on the Points of Interest are "reliable" in any way.
+
+```{r, echo = FALSE,include=FALSE}
+lats_ <- data_clean$latitude
+longs_ <- data_clean$longitude
+locations <- cbind(lats_, longs_)
+
+```
+
+```{r, echo=FALSE}
+map1 <- leaflet() %>%
+  setView(lng = 12.4964, lat = 41.9028, zoom = 12) %>%
+  addTiles() %>%
+  addMarkers(lng = locations[,2], lat = locations[,1], clusterOptions = markerClusterOptions())
+
+map1
+```
+
+As hypothesized, we can observe that the areas with the highest concentration of Airbnb listings are indeed the historic center, particularly the region between the Colosseum and Termini Station, the area around Piazza di Spagna/Via del Corso, Trastevere, and finally the Vatican along with the adjacent Prati neighborhood.
+
+To provide an additional useful visualization of our data, the map of Rome is displayed below as before. However, this time, the map highlights areas with more expensive Airbnb listings. Once again, the aforementioned points of interest are prominent, with particular emphasis on the areas surrounding Piazza Navona.
+
+```{r, echo=FALSE}
+top_1000_expensive <- data_clean %>%
+  arrange(desc(price)) %>%
+  head(1000)
+
+m <- leaflet() %>%
+  addTiles() %>%
+  setView(lng = 12.4964, lat = 41.9028, zoom = 12)
+
+heat_data <- top_1000_expensive %>%
+  dplyr::select(latitude, longitude) %>%
+  as.data.frame()
+
+m <- m %>%
+  addHeatmap(lng = heat_data$longitude, lat = heat_data$latitude, radius = 20)
+
+m
+```
+
+
+## Features Analysis
+
+```{r, echo = FALSE}
+
+ggplot(data_clean, aes(x = price)) +
+  geom_density(fill = "steelblue", alpha = 0.7) +
+  scale_x_continuous(
+    trans = 'log',
+    breaks = log_breaks(base = 10),
+    labels = label_number()
+  ) +
+  theme_minimal() +
+  labs(title = "Density Plot of Prices",
+       x = "Price",
+       y = "Density") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+```
+
+```{r, echo =FALSE}
+cat("The average price of the AirBnbs in Rome is ", round(mean(data_clean$price), 2),"$")
+
+```
+
+
+To analyze how Airbnb prices are distributed by neighborhood, we first examine the distribution of listings across different neighborhoods. As anticipated, the neighborhood with the highest number of listings is **Centro Storico**, with over 3,000 more properties compared to the second most populated neighborhood, **San Giovanni**.
+
+
+```{r, echo = FALSE}
+
+neighborhood_counts <- data_clean %>%
+  count(neighbourhood_cleansed)# %>%
+
+ggplot(neighborhood_counts, aes(x = reorder(neighbourhood_cleansed, n), y = n, fill=neighbourhood_cleansed)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  
+  labs(title = "Neighborhoods by Number of Listings",
+       x = "Neighborhood",
+       y = "Number of Listings") +
+  theme_minimal() +
+  theme(legend.position = 'none')
+```
+
+
+The following chart illustrates how prices vary by neighborhood, using the top 5 neighborhoods by number of listings as a sample. Above the box for each neighborhood, the average price of Airbnb listings in that area is indicated.
+
+We can observe that Centro Storico has a significantly higher average price compared to the overall average, followed by Aurelia. Among the top 5 neighborhoods, San Giovanni has the lowest average prices.
+
+```{r, echo =FALSE}
+
+prices_per_neigh <- subset(data_clean, neighbourhood_cleansed %in% c('I Centro Storico', 'II Parioli/Nomentano', 'VII San Giovanni/Cinecittà', 'XIII Aurelia', 'XII Monte Verde'))
+
+color_palette <- c('I Centro Storico' = '#1f77b4',  
+                   'II Parioli/Nomentano' = '#ff7f0e',  
+                   'VII San Giovanni/Cinecittà' = '#2ca02c',
+                   'XIII Aurelia' = '#d62728',
+                   'XII Monte Verde' = '#9467bd')  
+
+avg_prices <- prices_per_neigh %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(avg_price = mean(price, na.rm = TRUE)) %>%
+  mutate(avg_price = as.numeric(avg_price)) 
+
+ggplot(prices_per_neigh, aes(x = neighbourhood_cleansed, y = price, fill = neighbourhood_cleansed)) +
+  geom_boxplot() +
+  geom_text(data = avg_prices, aes(x = neighbourhood_cleansed, y = avg_price, label = sprintf("$%.2f", avg_price)), color = "black", vjust = -0.7) +
+  labs(title = "Price Distribution by Neighborhood",
+       x = NULL,  
+       y = "Price") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +  
+  scale_y_log10() +
+  scale_fill_manual(values = color_palette)
+
+```
+
+
+We will now analyze the types of properties listed on the site. A preliminary analysis of the dataset indicates that the predominant category is 'Entire rental unit,' which represents approximately 50% of the dataset.
+
+```{r, echo = FALSE}
+property_type_counts <- data %>%
+  count(property_type) %>%
+  filter(n > 10) %>%
+  arrange(desc(n)) %>%
+  mutate(percentage = n / sum(n) * 100)
+
+ggplot(property_type_counts, aes(x = reorder(property_type, n), y = n, fill = property_type)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.1f%%", percentage)), hjust = -0.2, size = 2.5) + 
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 5000)) +
+  labs(title = "Distribution of Property Types",
+       x = "Property Type",
+       y = "Number of Listings") +
+  theme_minimal() +
+  theme(legend.position = 'none')
+```
+We can again observe that the average price varies quite significantly depending on the type of accommodation chosen. Specifically, the average price for an *'Entire rental unit'* is approximately twice as high as that for a *'Private room'* within the same unit.
+
+```{r, echo =FALSE}
+prices_per_proptype <- subset(data_clean, property_type %in% c('Entire rental unit', 'Entire condo', 'Private room in rental unit', 'Private room in bed and breakfast'))
+
+color_palette_pt <- c('Entire rental unit' = '#1f77b4',  
+                   'Entire condo' = '#ff7f0e',  
+                   'Private room in rental unit' = '#2ca02c',
+                   'Private room in bed and breakfast' = '#d62728')  
+
+avg_prices_pt <- prices_per_proptype %>%
+  group_by(property_type) %>%
+  summarise(avg_price = mean(price, na.rm = TRUE)) %>%
+  mutate(avg_price = as.numeric(avg_price)) 
+
+ggplot(prices_per_proptype, aes(x = property_type, y = price, fill = property_type)) +
+  geom_boxplot() +
+  geom_text(data = avg_prices_pt, aes(x = property_type, y = avg_price, label = sprintf("$%.2f", avg_price)), color = "black", vjust = -0.7) +
+  labs(title = "Price Distribution by Property type",
+       x = NULL,  
+       y = "Price") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +  
+  scale_y_log10() +
+  scale_fill_manual(values = color_palette_pt)
+```
+
+
+Talking about room types, we can clearly see a predominance of the 'Entire home/apt' rather than 'Private room'. after all, the airbnb platform is made specifically for these room types and not for hotels (like its competitor Booking).
+
+```{r, echo =FALSE}
+room_type_counts <- data %>%
+  count(room_type) %>%
+  arrange(desc(n))
+
+# Create a bar chart for the distribution of property types
+ggplot(room_type_counts, aes(x = reorder(room_type, n), y = n, fill=room_type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Distribution of Room Types",
+       x = "Room Type",
+       y = "Number of Listings") +
+  theme_minimal() +
+  theme(legend.position = 'none')
+```
+
+Also here is trivial that the prices of Entire home and Hotel Room are almost the same, with the Entire home prices slightly higher. The price drop for Private rooms and in specific is really low in Shared rooms, but that's fine because you don't have the entire unit for yourself but you must share it in some way (e.g. hostels).  
+
+```{r, echo = FALSE}
+
+prices_per_roomtype <- subset(data_clean, room_type %in% c('Entire home/apt', 'Private room', 'Hotel room', 'Shared room'))
+
+color_palette_rt <- c('Entire home/apt' = '#1f77b4',  
+                   'Private room' = '#ff7f0e',  
+                   'Hotel room' = '#2ca02c',
+                   'Shared room' = '#d62728')  
+
+avg_prices_rt <- prices_per_roomtype %>%
+  group_by(room_type) %>%
+  summarise(avg_price = mean(price, na.rm = TRUE)) %>%
+  mutate(avg_price = as.numeric(avg_price)) 
+
+ggplot(prices_per_roomtype, aes(x = room_type, y = price, fill = room_type)) +
+  geom_boxplot() +
+  geom_text(data = avg_prices_rt, aes(x = room_type, y = avg_price, label = sprintf("$%.2f", avg_price)), color = "black", vjust = -0.7) +
+  labs(title = "Price Distribution by Room type",
+       x = NULL,  
+       y = "Price") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +  
+  scale_y_log10() +
+  scale_fill_manual(values = color_palette_rt)
+```
+
+
+
+To go further in the analysis, we can observe that there is a strong dominance of accommodation that can host groups from 3 to 6 people (maybe families or a group of friends), followed by smaller ones with max 1-2 guests.
+The same situation can be observed looking at the distribution of 'beds', with a strong dominance of places with 2 beds (that could host up to 4 people)
+
+```{r, echo=FALSE}
+data_long_accommodates <- data_clean %>%
+  dplyr::select(accommodates_1_2, accommodates_3_6, accommodates_7_15) %>%
+  pivot_longer(cols = everything(), names_to = "accommodates_group", values_to = "Count")
+
+plot1 <- ggplot(data_long_accommodates, aes(x = accommodates_group, y = Count)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  labs(title = "Distribution of Accommodates Groups") +
+  xlab("") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plot2 <- ggplot(data_clean, aes(x = factor(max2_beds))) + 
+  geom_bar(fill='#ff6966') + 
+  scale_x_discrete(labels = c("0" = "No", "1" = "Yes")) +
+  xlab("Has2Beds") + 
+  ylab("Count") + 
+  ggtitle("Histogram of beds") +
+  theme_minimal()
+
+
+grid.arrange(plot1, plot2, ncol = 2)
+
+```
+
+
+```{r, include=FALSE, echo=FALSE}
+# Function to plot feature distributions
+plot_distribution <- function(df, features) {
+  for (feature in features) {
+    p <- ggplot(df, aes_string(x = feature)) +
+      geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+      labs(title = paste("Distribution of", feature)) +
+      theme_minimal()
+    print(p)
+  }
+}
+```
+
+```{r echo = FALSE}
+tolog <- c("distance_from_colosseo", "distance_from_vaticano",
+           "distance_from_trastevere", "distance_from_spagna")
+
+plot_distribution <- function(df, features){
+  for (feature in features){
+    if (feature %in% tolog){
+      p <- ggplot(df, aes_string(x = feature)) +
+      geom_histogram(aes(y = ..density..), bins = 50, fill = "skyblue", color = "black", alpha = 0.6) +
+      scale_x_continuous(trans = 'log', breaks = log_breaks(base = 10), labels = label_number() ) +
+      geom_density(alpha = 0.3, fill = "red") +
+      labs(title = paste("Distribution of", feature), x = feature, y = "Density") +
+      theme_minimal()
+      
+      print(p)
+    } else {
+      p <- ggplot(df, aes_string(x = feature)) +
+      geom_histogram(aes(y = ..density..), bins = 50, fill = "skyblue", color = "black", alpha = 0.6) +
+      geom_density(alpha = 0.3, fill = "red") +
+      labs(title = paste("Distribution of", feature), x = feature, y = "Density") +
+      theme_minimal()
+      
+      print(p)
+    }
+  }
+}
+
+```
+
+Here we can see the distribution of the numerical features of interest.
+
+```{r echo=FALSE, warning=FALSE}
+# List of numeric features
+numeric_features <- c( "host_response_rate", "host_acceptance_rate",
+                      "availability_365", "number_of_reviews",
+                      "review_scores_cleanliness", "review_scores_communication",
+                      "review_scores_location",
+                      "distance_from_colosseo", "distance_from_vaticano",
+                      "distance_from_trastevere", "distance_from_spagna")
+
+# Plot distributions
+plot_distribution(data_clean, numeric_features)
+
+```
+
+
+
+
+```{r, warning=FALSE, echo=FALSE}
+tosave_3 <- c("price", "host_response_rate", "host_acceptance_rate",
+              "accommodates_1_2", "accommodates_3_6", "accommodates_7_15",
+              "max2_beds", "availability_365", "number_of_reviews",
+              "review_scores_cleanliness", "review_scores_communication", "review_scores_location",
+              "distance_from_colosseo", "distance_from_vaticano",
+              "distance_from_trastevere", "distance_from_spagna")
+
+air_prices <- data_clean %>%
+  dplyr::select(tosave_3) %>%
+  mutate( price = log(1+price))
+```
+
+```{r, fig.width=10, fig.height=8, echo = FALSE}
+cor_matrix <- cor(air_prices)
+
+par(mar = c(2, 2, 2, 2))
+
+
+corrplot(cor_matrix,
+         method = "color",
+         title = "Correlation Matrix of AirBnB features",
+         addCoef.col = "navy",
+         tl.cex = 0.65,
+         number.cex = 0.7,
+         addshade = "positive")
+```
+Based on our analysis, the columns most strongly correlated with price are:
+
+* accommodates_\*
+* beds
+* host acceptance rate
+* review score location
+* distances from points of interest
+
+To mitigate redundancy and multicollinearity, we will retain only the *review_score_location* variable. This variable exhibits a significant correlation with price and demonstrates a high correlation with other review scores. The *host_response_rate* will be excluded due to its low informational value, along with the *number_of_reviews* and availability throughout the year.
+
+
+# Models {.tabset}
+
+## First Model
+
+
+
+
+```jags
+model {
+  for (i in 1:N) {
+    price[i] ~ dnorm(mu[i], tau)
+    mu[i] <- beta0 + beta1 * host_acceptance_rate[i] + beta2 * accommodates_1_2[i] +
+             beta3 * accommodates_3_6[i] + beta4 * accommodates_7_15[i] +
+             beta5 * max2_beds[i] + beta6 * review_scores_location[i] +
+             beta7 * distance_from_colosseo[i] + beta8 * distance_from_vaticano[i] +
+             beta9 * distance_from_trastevere[i] + beta10 * distance_from_spagna[i]
+  }
+
+  tau <- 1 / (sigma * sigma)
+  sigma ~ dunif(0, 100)
+
+  beta0 ~ dnorm(0, 0.01)
+  beta1 ~ dnorm(0, 0.01)
+  beta2 ~ dnorm(0, 0.01)
+  beta3 ~ dnorm(0, 0.01)
+  beta4 ~ dnorm(0, 0.01)
+  beta5 ~ dnorm(0, 0.01)
+  beta6 ~ dnorm(0, 0.01)
+  beta7 ~ dnorm(0, 0.01)
+  beta8 ~ dnorm(0, 0.01)
+  beta9 ~ dnorm(0, 0.01)
+  beta10 ~ dnorm(0, 0.01)
+}
+```
+
+
+```{r, echo=FALSE}
+data_jags <- list(
+  price = air_prices$price,
+  host_acceptance_rate = air_prices$host_acceptance_rate,
+  accommodates_1_2 = air_prices$accommodates_1_2,
+  accommodates_3_6 = air_prices$accommodates_3_6,
+  accommodates_7_15 = air_prices$accommodates_7_15,
+  max2_beds = air_prices$max2_beds,
+  review_scores_location = air_prices$review_scores_location,
+  distance_from_colosseo = air_prices$distance_from_colosseo,
+  distance_from_vaticano = air_prices$distance_from_vaticano,
+  distance_from_trastevere = air_prices$distance_from_trastevere,
+  distance_from_spagna = air_prices$distance_from_spagna,
+  N = nrow(air_prices)
+)
+```
+
+
+```{r echo=FALSE}
+params <- c("beta0", "beta1", "beta2", "beta3", "beta4", "beta5",
+            "beta6", "beta7", "beta8", "beta9", "beta10", "sigma")
+```
+
+
+
+```{r}
+set.seed(123)
+model_1 <- jags(data = data_jags,
+                parameters.to.save=params,
+                model.file= "standard_bayesian_linear_model_2.txt",
+                n.chains = 3,
+                n.iter=5000,
+                n.burnin=1000,
+                n.thin=5
+                )
+
+model_1
+```
+Parameters:
+
+*  *beta0* (Intercept) has a mean of 5.285 with a 95% credible interval [4.599, 5.952], indicating a positive intercept.
+
+* *beta1* through *beta9* represent various coefficients with estimated values ranging from small positive effects to significant negative effects.
+
+* *sigma* (residual standard deviation) is estimated at 0.463 with a 95% credible interval [0.455, 0.470], suggesting low variability in residuals.
+
+* The model's *Rhat* values are close to 1, indicating good convergence, and effective sample sizes are generally high, ensuring reliable parameter estimates.
+
+* The deviance value of 9417.350 suggests the overall fit of the model, with a narrow credible interval indicating stability in fit across iterations.
+
+
+
+Now let's provide some diagnostic in order to see if results are reliable.
+
+### Density and TracePlot
+
+```{r echo=FALSE}
+
+chainArray <- model_1$BUGSoutput$sims.array
+
+bayesplot::mcmc_combo(chainArray, pars = c("deviance", "beta0", "beta1", "beta2"))
+bayesplot::mcmc_combo(chainArray, pars = c("beta3", "beta4", "beta5", "beta6"))
+bayesplot::mcmc_combo(chainArray, pars = c("beta7", "beta8", "beta9", "beta10", "sigma"))
+
+```
+
+### Autocorrelation
+
+
+```{r echo=FALSE, fig.align="center", fig.width=10, fig.height=10}
+coda.fit <- coda::as.mcmc(model_1)
+
+coda::acfplot(coda.fit)
+```
+
+Here, we see that the correlations are going further from the first lag, this is strictly decreasing going close to 0.
+
+In order to have further confirmation
+```{r echo=FALSE, fig.align="center", fig.width=10, fig.height=10}
+autocorr.diag(as.mcmc(model_1))
+```
+The autocorrelation diagnostics indicate good mixing of the MCMC chains, with autocorrelation values going to 0 as the lags increase, suggesting that the samples are effectively independent and well-behaved.
+
+### Stationarity
+
+```{r echo=FALSE, fig.align='center', fig.width=15, fig.height=7}
+
+
+par(mfrow=c(1,5))
+
+for (variable in c('beta0','beta1','beta2','beta3',
+                   'beta4','beta5','beta6','beta7',
+                   'beta8','beta9','beta10', 'sigma'))
+{ l <- c(0)
+  for (i in model_1$BUGSoutput$sims.matrix[,variable])
+  {
+    l <- c(l, (i+sum(l))/length(l))
+  }
+  plot(tail(l,-1),
+       xlab='t',
+       ylab='mean',
+       main=paste('Empirical Mean',variable,sep=' - '),
+       col='blue',
+       type='l')
+
+}
+
+
+```
+
+The plots of empirical means for each parameter clearly show that the means stabilize over time, indicating that the MCMC chains have converged and the parameter estimates are reliable.
+
+### Geweke diagnostic
+
+The Geweke diagnostic computes the ratio of the estimated means between the first 10% of iterations and the last 50%, normalized by standard errors. In order to be good, all Z-scores must be within $|Z| < 1.96$.
+
+```{r}
+coda::geweke.diag(coda.fit)
+```
+We can clearly see that all the values match the requirement $|Z|<1.96$, except for beta10 in the first chain and beta1 in the second chain. This indicates a possible lack of convergence for this parameter, it is good to consider additional diagnostics.
+
+### Heidelberger diagnostic
+
+The Heidelberger and Welch diagnostic assesses MCMC convergence by evaluating the stationarity of parameter estimates and the precision of confidence intervals. A "passed" result for the stationarity test indicates that the chains have stabilized, while passing the halfwidth test suggests that the parameter estimates are precise and reliable. With all parameters meeting these criteria, the test supports the conclusion that the MCMC chains have converged well, ensuring robust and dependable results.
+
+The Heidel test first divide the MCMC chain into several segments, each one long enough to provide a reasonable estimate of the parameters. Suddenly, for each segment, the test checks if the sample means and variances are stationary. If they are, it suggests that the chain has converged.
+
+
+```{r}
+coda.fit <- coda::as.mcmc(model_1)
+coda::heidel.diag(coda.fit)
+```
+
+The Heidelberger and Welch diagnostic results indicate that all parameters passed the stationarity test, with high p-values suggesting that the chains have stabilized. Additionally, the halfwidth tests passed for all parameters, with narrow confidence intervals indicating precise estimates. Overall, these results suggest that the MCMC chains have converged well and the parameter estimates are reliable.
+
+### Gelman Rubin diagnostic
+
+```{r}
+coda::gelman.diag(coda.fit)
+```
+It compares the variance within each chain to the variance between chains. The diagnostic provides a point estimate and an upper confidence interval (C.I.).
+
+We can say that all the parameters converge for this diagnostic (Upper CI are all $\simeq 1$)
+
+### HPD
+
+```{r}
+chainMat <- model_1$BUGSoutput$sims.matrix
+
+(p.HPD.jags <- coda::HPDinterval(as.mcmc(chainMat)))
+
+```
+The HPD intervals provide a credible range for each parameter, with significant parameters having intervals that do not include zero.
+
+We can see from the HPD that no interval include zero, suggesting that all the parameters are significative.
+
+### Approximation error
+
+```{r echo=FALSE}
+n <- length(colnames(model_1$BUGSoutput$sims.matrix))
+mcse_dataframe <- data.frame(MCSE = rep(NA, n))
+
+rownames(mcse_dataframe) <- colnames(model_1$BUGSoutput$sims.matrix)[1:n] 
+MCSE <- c()
+for(colname in colnames(model_1$BUGSoutput$sims.matrix)[1:n]){
+  MCSE <- c(MCSE,LaplacesDemon::MCSE(model_1$BUGSoutput$sims.matrix[ , colname]))
+}
+
+mcse_dataframe['MCSE'] <- MCSE
+
+```
+
+```{r,echo=FALSE}
+datatable(mcse_dataframe)
+```
+
+The approximation error is calculated dividing the standard deviation of the samples by the square root of the effective sample size. The smaller the MCSE(Monte Carlo standard Error), the more precise the estimate of the parameter.
+
+### Posterior uncertainty
+
+```{r echo=FALSE}
+
+beta0_var = var(model_1$BUGSoutput$sims.matrix[,'beta0'])
+beta1_var = var(model_1$BUGSoutput$sims.matrix[,'beta1'])
+beta2_var = var(model_1$BUGSoutput$sims.matrix[,'beta2'])
+beta3_var = var(model_1$BUGSoutput$sims.matrix[,'beta3'])
+beta4_var = var(model_1$BUGSoutput$sims.matrix[,'beta4'])
+beta5_var = var(model_1$BUGSoutput$sims.matrix[,'beta5'])
+beta6_var = var(model_1$BUGSoutput$sims.matrix[,'beta6'])
+beta7_var = var(model_1$BUGSoutput$sims.matrix[,'beta7'])
+beta8_var = var(model_1$BUGSoutput$sims.matrix[,'beta8'])
+beta9_var = var(model_1$BUGSoutput$sims.matrix[,'beta9'])
+beta10_var = var(model_1$BUGSoutput$sims.matrix[,'beta10'])
+sigma_var = var(model_1$BUGSoutput$sims.matrix[,'sigma'])
+
+
+```
+
+```{r echo=FALSE}
+variance = as.data.frame(matrix(c(beta0_var,beta1_var,beta2_var,beta3_var,beta4_var,
+                                  beta5_var,beta6_var,beta7_var,beta8_var,beta9_var,
+                                  beta10_var, sigma_var
+                                  ),ncol=1),col.names='variance')
+
+rownames(variance)=c('beta0','beta1','beta2','beta3',
+                     'beta4','beta5','beta6','beta7',
+                     'beta8','beta9','beta10', "sigma")
+datatable(variance)
+```
+
+The posterior uncertainties for beta1, beta5, beta6, beta7, beta8, beta9 and beta10 are very low, indicating high confidence in these estimates.
+
+beta0, beta2, beta3 and beta4 have higher uncertainties, suggesting more variability and less precise information from the data.
+
+The uncertainty for sigma is low and that indicates a precise estimate of the variability in the data.
+
+### RMSE Model 1
+
+```{r,echo=FALSE, warning=FALSE}
+
+beta_<-c(model_1$BUGSoutput$summary["beta0", "mean"],
+         model_1$BUGSoutput$summary["beta1", "mean"],
+         model_1$BUGSoutput$summary["beta2", "mean"],
+         model_1$BUGSoutput$summary["beta3", "mean"],
+         model_1$BUGSoutput$summary["beta4", "mean"],
+         model_1$BUGSoutput$summary["beta5", "mean"],
+         model_1$BUGSoutput$summary["beta6", "mean"],
+         model_1$BUGSoutput$summary["beta7", "mean"],
+         model_1$BUGSoutput$summary["beta8", "mean"],
+         model_1$BUGSoutput$summary["beta9", "mean"],
+         model_1$BUGSoutput$summary["beta10", "mean"]
+         )
+
+sig2_<-  model_1$BUGSoutput$summary["sigma", "mean"]
+
+Bayesian_prediction<-function(x_,beta_,sig2_){
+  Y=beta_[1]+beta_[2]*x_[1]+beta_[3]*x_[2]+beta_[4]*x_[3] +
+    beta_[5]*x_[4]+beta_[6]*x_[5]+beta_[7]*x_[6]+beta_[8]*x_[7] +
+    beta_[9]*x_[8]+beta_[10]*x_[9]+beta_[11]*x_[10]
+  return(Y)
+}
+
+data_jags_df <- as.data.frame(data_jags)
+
+y_hat<-c()
+for(i in 1:nrow(data_jags_df)){
+  x_<-as.matrix(data_jags_df[i,c(2,3,4,5,6,7,8,9,10,11)])
+  y_hat<-c(y_hat,Bayesian_prediction(x_,beta_,sig2_))
+}
+
+y_true<-as.vector(data_jags_df$price)
+cat("The RMSE for the Bayesian Regression is:",rmse(y_true, y_hat))
+```
+
+
+## Second Model
+
+```jags
+
+model {
+  for (i in 1:N) {
+    price[i] ~ dnorm(mu[i], tau)
+    mu[i] <- beta0 + beta1 * host_acceptance_rate[i] + beta2 * accommodates_1_2[i] +
+             beta3 * accommodates_3_6[i] + beta4 * accommodates_7_15[i] +
+             beta5 * max2_beds[i] + beta6 * review_scores_location[i] +
+             beta7 * distance_from_colosseo[i] + beta8 * distance_from_vaticano[i] +
+             beta9 * distance_from_trastevere[i] + beta10 * distance_from_spagna[i]
+  }
+
+  tau <- 1 / (sigma * sigma)
+  sigma ~ dunif(0, 100)
+
+  beta0 ~ dnorm(1, tau_beta)
+  beta1 ~ dnorm(0, tau_beta)
+  beta2 ~ dnorm(0, tau_beta)
+  beta3 ~ dnorm(0, tau_beta)
+  beta4 ~ dnorm(0, tau_beta)
+  beta5 ~ dnorm(0, tau_beta)
+  beta6 ~ dnorm(0, tau_beta)
+  beta7 ~ dnorm(0.5, tau_beta)
+  beta8 ~ dnorm(0, tau_beta)
+  beta9 ~ dnorm(0, tau_beta)
+  beta10 ~ dnorm(0.5, tau_beta)
+
+  tau_beta ~ dgamma(0.1, 0.1)
+}
+
+```
+
+```{r}
+model_2 <- jags(data = data_jags,
+                parameters.to.save=params,
+                model.file= "regularization_model.txt",
+                n.chains = 3,
+                n.iter=5000,
+                n.burnin=1000,
+                n.thin=5
+                )
+
+model_2
+```
+
+### Density and TracePlot
+
+```{r}
+
+chainArray <- model_2$BUGSoutput$sims.array
+
+bayesplot::mcmc_combo(chainArray, pars = c("deviance", "beta0", "beta1", "beta2"))
+bayesplot::mcmc_combo(chainArray, pars = c("beta3", "beta4", "beta5", "beta6"))
+bayesplot::mcmc_combo(chainArray, pars = c("beta7", "beta8", "beta9", "beta10", "sigma"))
+
+```
+
+### Autocorrelation
+
+
+```{r echo=FALSE, fig.align="center", fig.width=10, fig.height=10}
+coda.fit <- coda::as.mcmc(model_2)
+
+coda::acfplot(coda.fit)
+
+```
+
+```{r echo=FALSE}
+autocorr.diag(as.mcmc(model_2))
+
+```
+Also in this model the shape of the convergence looks like similar with the chains that mix well.
+
+### Heidel test
+
+```{r, echo=FALSE}
+coda.fit2 <- coda::as.mcmc(model_2)
+
+coda::heidel.diag(coda.fit2)
+
+```
+
+As with the previous model, we can see that all the tests are passed, suggesting that the MCMC chains have converged well.
+
+
+### Posterior uncertainty
+
+```{r echo=FALSE}
+
+beta0_var = var(model_2$BUGSoutput$sims.matrix[,'beta0'])
+beta1_var = var(model_2$BUGSoutput$sims.matrix[,'beta1'])
+beta2_var = var(model_2$BUGSoutput$sims.matrix[,'beta2'])
+beta3_var = var(model_2$BUGSoutput$sims.matrix[,'beta3'])
+beta4_var = var(model_2$BUGSoutput$sims.matrix[,'beta4'])
+beta5_var = var(model_2$BUGSoutput$sims.matrix[,'beta5'])
+beta6_var = var(model_2$BUGSoutput$sims.matrix[,'beta6'])
+beta7_var = var(model_2$BUGSoutput$sims.matrix[,'beta7'])
+beta8_var = var(model_2$BUGSoutput$sims.matrix[,'beta8'])
+beta9_var = var(model_2$BUGSoutput$sims.matrix[,'beta9'])
+beta10_var = var(model_2$BUGSoutput$sims.matrix[,'beta10'])
+sigma_var = var(model_2$BUGSoutput$sims.matrix[,'sigma'])
+
+
+```
+
+```{r echo=FALSE}
+variance = as.data.frame(matrix(c(beta0_var,beta1_var,beta2_var,beta3_var,beta4_var,
+                                  beta5_var,beta6_var,beta7_var,beta8_var,beta9_var,
+                                  beta10_var, sigma_var
+                                  ),ncol=1),col.names='variance')
+
+rownames(variance)=c('beta0','beta1','beta2','beta3',
+                     'beta4','beta5','beta6','beta7',
+                     'beta8','beta9','beta10', "sigma")
+datatable(variance)
+```
+Like in the previous model we can see that beta0, beta2, beta3 and beta4 have higher uncertainties with respect to the other betas.
+
+
+### RMSE Model 2
+
+```{r,echo=FALSE}
+
+beta_<-c(model_2$BUGSoutput$summary["beta0", "mean"],
+         model_2$BUGSoutput$summary["beta1", "mean"],
+         model_2$BUGSoutput$summary["beta2", "mean"],
+         model_2$BUGSoutput$summary["beta3", "mean"],
+         model_2$BUGSoutput$summary["beta4", "mean"],
+         model_2$BUGSoutput$summary["beta5", "mean"],
+         model_2$BUGSoutput$summary["beta6", "mean"],
+         model_2$BUGSoutput$summary["beta7", "mean"],
+         model_2$BUGSoutput$summary["beta8", "mean"],
+         model_2$BUGSoutput$summary["beta9", "mean"],
+         model_2$BUGSoutput$summary["beta10", "mean"]
+         )
+
+sig2_<-  model_2$BUGSoutput$summary["sigma", "mean"]
+
+Bayesian_prediction<-function(x_,beta_,sig2_){
+  Y=beta_[1]+beta_[2]*x_[1]+beta_[3]*x_[2]+beta_[4]*x_[3] +
+    beta_[5]*x_[4]+beta_[6]*x_[5]+beta_[7]*x_[6]+beta_[8]*x_[7] +
+    beta_[9]*x_[8]+beta_[10]*x_[9]+beta_[11]*x_[10]
+  return(Y)
+}
+
+
+data_jags_df <- as.data.frame(data_jags)
+
+y_hat<-c()
+for(i in 1:nrow(data_jags_df)){
+  x_<-as.matrix(data_jags_df[i,c(2,3,4,5,6,7,8,9,10,11)])
+  y_hat<-c(y_hat,Bayesian_prediction(x_,beta_,sig2_))
+}
+
+y_true<-as.vector(data_jags_df$price)
+cat("The RMSE for the Bayesian Regression is:",rmse(y_true,y_hat))
+```
+
+## Frequentist model
+
+```{r}
+model_lm <- lm(price ~ host_acceptance_rate+accommodates_1_2+accommodates_3_6+
+                 accommodates_7_15+max2_beds+review_scores_location+
+                 distance_from_colosseo+distance_from_vaticano+
+                 distance_from_trastevere+distance_from_spagna,
+               data = data_jags)  
+summary(model_lm)
+```
+
+We want now to evaluate the RMSE for the frequentist model:
+
+
+
+```{r,echo=FALSE}
+ y_hat_<-as.vector(as.numeric(coef(model_lm)[1])+
+                     as.numeric(coef(model_lm)[2])*data_jags_df$host_acceptance_rate+
+                     as.numeric(coef(model_lm)[3])*data_jags_df$accommodates_1_2+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$accommodates_3_6+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$accommodates_7_15+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$max2_beds+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$review_scores_location+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$distance_from_colosseo+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$distance_from_vaticano+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$distance_from_trastevere+
+                     as.numeric(coef(model_lm)[4])*data_jags_df$distance_from_spagna
+                     ) 
+cat("The RMSE for the classic model is", rmse(exp(y_hat_), data_jags_df$price))
+```
+
+
+
+# Conclusions
+
+The most relevant feature for the model result to be the accommodates_*, followed by the review_score_location. Contrary to what one might expect, the features relating to proximity to POIs do not appear to be decisive. 
+
+Clearly the available features are not sufficient to determine a good predictive model, as we can imagine, airbnb prices can depend on many other factors such as the conditions of the room and the proximity to means of transport.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
